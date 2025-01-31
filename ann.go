@@ -3,6 +3,7 @@ package main
 import (
     "fmt"
     "math"
+    "math/rand"
     "sort"
 )
 
@@ -16,20 +17,152 @@ type Product struct {
     Description string
 }
 
+// LSH를 위한 구조체
+type LSHIndex struct {
+    hashTables []map[string][]int  // 해시 테이블들
+    numTables  int                 // 해시 테이블 개수
+    numBands   int                 // LSH 밴드 개수
+    bandSize   int                 // 각 밴드의 크기
+}
+
+// LSH 인덱스 생성
+func NewLSHIndex(numTables, numBands, bandSize int) *LSHIndex {
+    hashTables := make([]map[string][]int, numTables)
+    for i := range hashTables {
+        hashTables[i] = make(map[string][]int)
+    }
+    return &LSHIndex{
+        hashTables: hashTables,
+        numTables:  numTables,
+        numBands:   numBands,
+        bandSize:   bandSize,
+    }
+}
+
+// LSH 해시 함수
+func (lsh *LSHIndex) hashVector(vector []float64, tableIdx int) string {
+    rand.Seed(int64(tableIdx))
+    hash := ""
+    for i := 0; i < lsh.numBands; i++ {
+        bandHash := 0
+        for j := 0; j < lsh.bandSize && (i*lsh.bandSize+j) < len(vector); j++ {
+            randVal := rand.Float64()
+            if vector[i*lsh.bandSize+j] > randVal {
+                bandHash = bandHash*2 + 1
+            } else {
+                bandHash = bandHash * 2
+            }
+        }
+        hash += fmt.Sprintf("_%d", bandHash)
+    }
+    return hash
+}
+
+// PCA 차원 축소
+func pca(vectors [][]float64, targetDim int) [][]float64 {
+    if len(vectors) == 0 || targetDim >= len(vectors[0]) {
+        return vectors
+    }
+
+    // 1. 평균 계산
+    dim := len(vectors[0])
+    mean := make([]float64, dim)
+    for _, v := range vectors {
+        for j := range v {
+            mean[j] += v[j]
+        }
+    }
+    for j := range mean {
+        mean[j] /= float64(len(vectors))
+    }
+
+    // 2. 중심화
+    centered := make([][]float64, len(vectors))
+    for i, v := range vectors {
+        centered[i] = make([]float64, dim)
+        for j := range v {
+            centered[i][j] = v[j] - mean[j]
+        }
+    }
+
+    // 3. 공분산 행렬 계산 (간단한 버전)
+    cov := make([][]float64, dim)
+    for i := range cov {
+        cov[i] = make([]float64, dim)
+        for j := range cov[i] {
+            for k := 0; k < len(vectors); k++ {
+                cov[i][j] += centered[k][i] * centered[k][j]
+            }
+            cov[i][j] /= float64(len(vectors) - 1)
+        }
+    }
+
+    // 4. 주성분 계산 (간단한 power iteration 방법)
+    components := make([][]float64, targetDim)
+    for i := range components {
+        components[i] = make([]float64, dim)
+        // 초기 벡터
+        for j := range components[i] {
+            components[i][j] = rand.Float64()
+        }
+        // Power iteration
+        for iter := 0; iter < 100; iter++ {
+            // 행렬-벡터 곱
+            newVec := make([]float64, dim)
+            for j := range newVec {
+                for k := range cov[j] {
+                    newVec[j] += cov[j][k] * components[i][k]
+                }
+            }
+            // 정규화
+            norm := 0.0
+            for j := range newVec {
+                norm += newVec[j] * newVec[j]
+            }
+            norm = math.Sqrt(norm)
+            for j := range newVec {
+                components[i][j] = newVec[j] / norm
+            }
+        }
+    }
+
+    // 5. 차원 축소된 데이터 계산
+    reduced := make([][]float64, len(vectors))
+    for i := range reduced {
+        reduced[i] = make([]float64, targetDim)
+        for j := 0; j < targetDim; j++ {
+            for k := range vectors[i] {
+                reduced[i][j] += (vectors[i][k] - mean[k]) * components[j][k]
+            }
+        }
+    }
+
+    return reduced
+}
+
 // VectorDB 구조체에 상품 정보 추가
 type VectorDB struct {
     products []Product
+    lshIndex *LSHIndex
 }
 
 func NewVectorDB() *VectorDB {
     return &VectorDB{
         products: make([]Product, 0),
+        lshIndex: NewLSHIndex(5, 4, 2), // 예: 5개 테이블, 4개 밴드, 밴드당 2개 해시
     }
 }
 
 // AddProduct는 상품을 데이터베이스에 추가합니다
 func (db *VectorDB) AddProduct(product Product) {
+    productIdx := len(db.products)
     db.products = append(db.products, product)
+    
+    // LSH 인덱스에 추가
+    for i := 0; i < db.lshIndex.numTables; i++ {
+        hash := db.lshIndex.hashVector(product.Vector, i)
+        db.lshIndex.hashTables[i][hash] = append(db.lshIndex.hashTables[i][hash], productIdx)
+    }
 }
 
 // SearchResult는 검색 결과를 저장하는 구조체입니다
@@ -58,18 +191,41 @@ func cosineSimilarity(a, b []float64) float64 {
     return dotProduct / (math.Sqrt(normA) * math.Sqrt(normB))
 }
 
-// Search 함수 수정
+// Search 함수 최적화
 func (db *VectorDB) Search(query []float64, topK int) []SearchResult {
-    results := make([]SearchResult, 0)
+    // LSH를 사용하여 후보 상품 찾기
+    candidateSet := make(map[int]bool)
+    for i := 0; i < db.lshIndex.numTables; i++ {
+        hash := db.lshIndex.hashVector(query, i)
+        if candidates, exists := db.lshIndex.hashTables[i][hash]; exists {
+            for _, idx := range candidates {
+                candidateSet[idx] = true
+            }
+        }
+    }
 
-    for _, product := range db.products {
-        similarity := cosineSimilarity(query, product.Vector)
+    // 후보 상품들에 대해서만 유사도 계산
+    results := make([]SearchResult, 0)
+    for idx := range candidateSet {
+        similarity := cosineSimilarity(query, db.products[idx].Vector)
         results = append(results, SearchResult{
-            Product:    product,
+            Product:    db.products[idx],
             Similarity: similarity,
         })
     }
 
+    // 결과가 없으면 모든 상품에 대해 검색
+    if len(results) == 0 {
+        for _, product := range db.products {
+            similarity := cosineSimilarity(query, product.Vector)
+            results = append(results, SearchResult{
+                Product:    product,
+                Similarity: similarity,
+            })
+        }
+    }
+
+    // 정렬 및 상위 K개 반환
     sort.Slice(results, func(i, j int) bool {
         return results[i].Similarity > results[j].Similarity
     })
@@ -143,5 +299,19 @@ func main() {
         fmt.Printf("가격: %.0f원\n", result.Product.Price)
         fmt.Printf("설명: %s\n", result.Product.Description)
         fmt.Printf("유사도: %.2f\n\n", result.Similarity)
+    }
+
+    // 차원 축소 예시
+    vectors := make([][]float64, len(db.products))
+    for i, product := range db.products {
+        vectors[i] = product.Vector
+    }
+    
+    // 5차원을 3차원으로 축소
+    reducedVectors := pca(vectors, 3)
+    
+    fmt.Println("\n차원 축소된 벡터들:")
+    for i, vec := range reducedVectors {
+        fmt.Printf("상품 %s의 축소된 벡터: %v\n", db.products[i].Name, vec)
     }
 }
